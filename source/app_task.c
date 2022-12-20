@@ -63,7 +63,45 @@
 #include "app_config.h"
 #include "app_task.h"
 
+#include "xensiv_dps3xx_mtb.h"
+#include "xensiv_pasco2_mtb.h"
+
 #define APP_VERSION "01.00.00"
+
+#if defined(TARGET_CYSBSYSKIT_DEV_01)
+/* Output pin for sensor PSEL line */
+#define MTB_PASCO2_PSEL (P5_3)
+/* Output pin for PAS CO2 Wing Board power switch */
+#define MTB_PASCO2_POWER_SWITCH (P10_5)
+/* Output pin for PAS CO2 Wing Board LED OK */
+#define MTB_PASCO2_LED_OK (P9_0)
+/* Output pin for PAS CO2 Wing Board LED WARNING  */
+#define MTB_PASCO2_LED_WARNING (P9_1)
+#endif
+
+/* Pin state to enable I2C channel of sensor */
+#define MTB_PASCO2_PSEL_I2C_ENABLE (0U)
+/* Pin state to enable power to sensor on PAS CO2 Wing Board*/
+#define MTB_PASCO2_POWER_ON (1U)
+/* Pin state for PAS CO2 Wing Board LED off. */
+#define MTB_PASCO_LED_STATE_OFF (0U)
+/* Pin state for PAS CO2 Wing Board LED on. */
+#define MTB_PASCO_LED_STATE_ON (1U)
+/* I2C bus frequency */
+#define I2C_MASTER_FREQUENCY (100000U)
+
+#define DEFAULT_PRESSURE_VALUE (1015.0F)
+
+/* Delay time after hardware initialization */
+#define PASCO2_INITIALIZATION_DELAY (2000)
+
+/* Delay time after each PAS CO2 readout */
+#define PASCO2_PROCESS_DELAY (1000)
+
+
+xensiv_pasco2_t xensiv_pasco2;
+xensiv_dps3xx_t xensiv_dps3xx;
+
 
 /* Macro to check if the result of an operation was successful and set the
  * corresponding bit in the status_flag based on 'init_mask' parameter. When
@@ -83,6 +121,8 @@
                              return result;                    \
                          }                                     \
                      } while(0)
+
+
 
 /******************************************************************************
  * Function Name: wifi_connect
@@ -153,16 +193,116 @@ static void publish_telemetry() {
     // TelemetryAddWith* calls are only required if sending multiple data points in one packet.
     iotcl_telemetry_add_with_iso_time(msg, iotcl_iso_timestamp_now());
     iotcl_telemetry_set_string(msg, "version", APP_VERSION);
-    iotcl_telemetry_set_number(msg, "cpu", 3.123); // test floating point numbers
+//    iotcl_telemetry_set_number(msg, "cpu", 3.123); // test floating point numbers
+
+    /* Read CO2 value from sensor */
+    uint16_t ppm = 0;
+    float32_t pressure = DEFAULT_PRESSURE_VALUE;
+    cy_rslt_t result = xensiv_pasco2_mtb_read(&xensiv_pasco2, (uint16_t)pressure, &ppm); //unit PPM
+    if (result == CY_RSLT_SUCCESS)
+    {
+    	printf("READ SUCCESS\r\n");
+    }
+    iotcl_telemetry_set_number(msg, "cpu", ppm); // test floating point numbers
 
     const char *str = iotcl_create_serialized_string(msg, false);
     iotcl_telemetry_destroy(msg);
     printf("Sending: %s\n", str);
     iotconnect_sdk_send_packet(str); // underlying code will report an error
     iotcl_destroy_serialized(str);
+
+    cyhal_system_delay_ms(500);
 }
 
+
+
 void app_task(void *pvParameters) {
+
+    cy_rslt_t result;
+
+    xensiv_dps3xx_t xensiv_dps3xx;
+
+    /* I2C variables */
+    cyhal_i2c_t cyhal_i2c;
+    /* initialize i2c library*/
+    cyhal_i2c_cfg_t i2c_master_config = {CYHAL_I2C_MODE_MASTER,
+                                         0 /* address is not used for master mode */,
+                                         I2C_MASTER_FREQUENCY};
+
+    result = cyhal_i2c_init(&cyhal_i2c, CYBSP_I2C_SDA, CYBSP_I2C_SCL, NULL);
+    if (result != CY_RSLT_SUCCESS)
+    {
+        CY_ASSERT(0);
+    }
+    result = cyhal_i2c_configure(&cyhal_i2c, &i2c_master_config);
+    if (result != CY_RSLT_SUCCESS)
+    {
+        CY_ASSERT(0);
+    }
+
+    /* Initialize and enable PAS CO2 Wing Board I2C channel communication*/
+    result = cyhal_gpio_init(MTB_PASCO2_PSEL, CYHAL_GPIO_DIR_OUTPUT, CYHAL_GPIO_DRIVE_STRONG, MTB_PASCO2_PSEL_I2C_ENABLE);
+    if (result != CY_RSLT_SUCCESS)
+    {
+        CY_ASSERT(0);
+    }
+
+    /* Initialize and enable PAS CO2 Wing Board power switch */
+    result = cyhal_gpio_init(MTB_PASCO2_POWER_SWITCH, CYHAL_GPIO_DIR_OUTPUT, CYHAL_GPIO_DRIVE_STRONG, MTB_PASCO2_POWER_ON);
+    if (result != CY_RSLT_SUCCESS)
+    {
+        CY_ASSERT(0);
+    }
+
+    /* Initialize the LEDs on PAS CO2 Wing Board */
+    result = cyhal_gpio_init(MTB_PASCO2_LED_OK, CYHAL_GPIO_DIR_OUTPUT, CYHAL_GPIO_DRIVE_STRONG, MTB_PASCO_LED_STATE_OFF);
+    if (result != CY_RSLT_SUCCESS)
+    {
+        CY_ASSERT(0);
+    }
+
+    result = cyhal_gpio_init(MTB_PASCO2_LED_WARNING, CYHAL_GPIO_DIR_OUTPUT, CYHAL_GPIO_DRIVE_STRONG, MTB_PASCO_LED_STATE_OFF);
+    if (result != CY_RSLT_SUCCESS)
+    {
+        CY_ASSERT(0);
+    }
+
+    /* Delay 2s to wait for pasco2 sensor get ready */
+    vTaskDelay(pdMS_TO_TICKS(PASCO2_INITIALIZATION_DELAY));
+
+    result = xensiv_dps3xx_mtb_init_i2c(&xensiv_dps3xx, &cyhal_i2c, XENSIV_DPS3XX_I2C_ADDR_ALT);
+    if (result != CY_RSLT_SUCCESS)
+    {
+    	printf("dps3xx device initialization error\n");
+    }
+
+    /* Initialize PAS CO2 sensor with default parameter values */
+    result = xensiv_pasco2_mtb_init_i2c(&xensiv_pasco2, &cyhal_i2c);
+    if (result != CY_RSLT_SUCCESS)
+    {
+        printf("PAS CO2 device initialization error\n");
+        printf("Exiting pasco2_task task\n");
+        // exit current thread (suspend)
+        return;
+    }
+    /* Configure PAS CO2 Wing board interrupt to enable 12V boost converter in wingboard */
+    xensiv_pasco2_interrupt_config_t int_config =
+    {
+        .b.int_func = XENSIV_PASCO2_INTERRUPT_FUNCTION_NONE,
+        .b.int_typ = (uint32_t)XENSIV_PASCO2_INTERRUPT_TYPE_LOW_ACTIVE
+    };
+
+    result = xensiv_pasco2_set_interrupt_config(&xensiv_pasco2, int_config);
+    if (result != CY_RSLT_SUCCESS)
+    {
+        printf("PAS CO2 interrupt configuration error");
+        CY_ASSERT(0);
+    }
+
+    cyhal_gpio_write(CYBSP_USER_LED, false); /* USER_LED is active low */
+
+    /* Turn on status LED on PAS CO2 Wing Board to indicate normal operation */
+    cyhal_gpio_write(MTB_PASCO2_LED_OK, MTB_PASCO_LED_STATE_ON);
 
     /* Structures that store the data to be sent/received to/from various
      * message queues.
